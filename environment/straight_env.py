@@ -4,16 +4,20 @@ import argparse
 import random
 import time
 
-from carla.client import make_carla_client
-from carla.sensor import Camera
-from carla.settings import CarlaSettings
-from carla.tcp import TCPConnectionError
-from carla.image_converter import to_rgb_array
+from environment.carla.sensor import Camera
+from environment.carla.settings import CarlaSettings
+from environment.carla.tcp import TCPConnectionError
+from environment.carla.image_converter import to_rgb_array
+from environment.carla.planner.planner import Planner
 
 import numpy as np
 from gym import spaces
 
-from carla_env import CarlaEnv
+from environment.carla_env import CarlaEnv
+from environment.carla_server import CarlaServer
+from environment.carla.client import CarlaClient
+
+from skimage.transform import resize
 
 """
 Units: 
@@ -27,15 +31,25 @@ collisions    kg*cm/s
 """
 - Check units
 - Check reward function
-- Make the server and client start together
 """
 
+
 class StraightDriveEnv(CarlaEnv):
-    def __init__(self, client, frame_skip=1, cam_width=800, cam_height=600, town_string='Town01'):
-        super().__init__(town_string)
+    def __init__(self, port, host='localhost', frame_skip=1, cam_width=800, cam_height=600, town_string='Town01', obs_size=84):
+        super(StraightDriveEnv, self).__init__()
+
+        self.c = CarlaServer(port)
+        while True:
+            try:
+                self.client = CarlaClient(host, port)
+                self.client.connect()
+                break
+            except TCPConnectionError as error:
+                print(error)
+                time.sleep(1) 
 
         self.frame_skip = frame_skip
-        self.client = client
+        self._planner = Planner(town_string)
 
         camera0 = Camera('CameraRGB')
         camera0.set(CameraFOV=100)
@@ -67,25 +81,23 @@ class StraightDriveEnv(CarlaEnv):
 
         self.scene = self.client.load_settings(settings)
 
-        img_shape = (cam_width, cam_height, 3)
+        img_shape = (obs_size, obs_size, 3)
         self.observation_space = spaces.Tuple(
-            (spaces.Box(-np.inf, np.inf, (3,)), 
-            spaces.Box(0, 255, img_shape))
+            (spaces.Box(0, 255, img_shape), 
+            spaces.Box(-np.inf, np.inf, (8,))
+            )
         )
-        self.action_space = spaces.Box(-np.inf, np.inf, shape=(3,))
+        self.action_space = spaces.Box(-1, 1, shape=(4,))
 
         self.prev_state = np.array([0., 0., 0.])
         self.prev_collisions = np.array([0., 0., 0.])
         self.prev_intersections = np.array([0., 0.])
 
-        self.t = 0
-
 
     def step(self, action):
-        steer = np.clip(-1, 1, action[0])
-        throttle = np.clip(0, 1, action[1])
-        brake = np.clip(0, 1, action[2])
-
+        steer = np.clip(action[0], -1, 1)
+        throttle = np.clip(action[1], 0, 1)
+        brake = np.clip(action[2], 0, 1)
         for i in range(self.frame_skip):
             self.t += 1
             self.client.send_control(
@@ -97,16 +109,18 @@ class StraightDriveEnv(CarlaEnv):
 
         measurements, sensor_data = self.client.read_data()
         sensor_data = self._process_image(sensor_data['CameraRGB'])
+        current_time = measurements.game_timestamp
 
-        state, collisions, intersections = self._process_measurements(measurements)
-        reward = self._calculate_reward(state, collisions, intersections)
-        done = self._calculate_done(collisions, state)
+        state, collisions, intersections, onehot = self._process_measurements(measurements)
+        reward, dist_goal = self._calculate_reward(state, collisions, intersections)
+        done = self._calculate_done(collisions, state, current_time)
 
         self.prev_state = np.array(state)
         self.prev_collisions = np.array(collisions)
         self.prev_intersections = np.array(intersections)
 
-        return (state, sensor_data), reward, done, {}
+        measurement_obs = self._generate_obs(state, collisions, onehot, dist_goal)
+        return (sensor_data, measurement_obs), reward, done, {}
 
 
     def reset(self):
@@ -119,25 +133,47 @@ class StraightDriveEnv(CarlaEnv):
         measurements, sensor_data = self.client.read_data()
         sensor_data = self._process_image(sensor_data['CameraRGB'])
         
-        state, collisions, intersections = self._process_measurements(measurements)
+        state, collisions, intersections, onehot = self._process_measurements(measurements)
     
         self.prev_state = np.array(state)
         self.prev_collisions = np.array(collisions)
         self.prev_intersections = np.array(intersections)
-        
+
+        self.start_time = measurements.game_timestamp
         self.t = 0
 
-        return (state, sensor_data)
-
-
-    def _calculate_done(self, collisions, state):
         pos = np.array(state[0:2])
         dist_goal = np.linalg.norm(pos - self.goal)
 
-        return self._calculate_timeout(dist_goal) or self._is_goal(dist_goal)
+        measurement_obs = self._generate_obs(state, collisions, onehot, dist_goal)
+
+        return (sensor_data, measurement_obs)
+
+
+    def _calculate_done(self, collisions, state, current_time):
+        pos = np.array(state[0:2])
+        dist_goal = np.linalg.norm(pos - self.goal)
+
+        return self._is_timed_out(current_time) or self._is_goal(dist_goal)
         
         # Not described in paper, but should be there for safe driving
-        return self._calculate_timeout(dist_goal) and self._collision_on_step(dist_goal)
+        return self._is_timed_out() and self._collision_on_step(dist_goal)
+
+
+    def _calculate_planner_onehot(self, measurements):
+        return np.array([0., 0., 0., 0., 1.]) # TODO need to debug
+        print(type(self.end_point.location), type(self.end_point.orientation))
+        val = self._planner.get_next_command(measurements.location, measurements.orientation, 
+            self.end_point.location, self.end_point.orientation)
+
+        if val == 0.0:
+            return np.array([1, 0, 0, 0, 0])
+
+        onehot = np.zeros(5)
+        val = int(val) - 1
+        onehot[val] = 1
+
+        return onehot
 
 
     def _calculate_reward(self, state, collisions, intersections):
@@ -146,21 +182,27 @@ class StraightDriveEnv(CarlaEnv):
         dist_goal_prev = np.linalg.norm(self.prev_state[0:2] - self.goal)
 
         speed = state[2]
-
+    
         # TODO: Check this?
-        r = (dist_goal_prev - dist_goal) / 10 + 0.05 * (speed - self.prev_state[2]) \
+        r = 1000 * (dist_goal_prev - dist_goal) / 10 + 0.05 * (speed - self.prev_state[2]) \
             - 2 * (sum(intersections) - sum(self.prev_intersections))
 
-        return r
+        return r, dist_goal
 
 
-    def _calculate_timeout(self, distance):
-        # TODO
-        return False
+    def _calculate_timeout(self):
+        self.timeout_t = ((self.timeout_dist / 100000.0) / 10.0) * 3600.0 + 10.0
 
 
     def _collision_on_step(self, collisions):
         return sum(collisions) > 0
+
+
+    def _generate_obs(self, state, collisions, onehot, dist_goal):
+        speed = state[2]
+        collisions = np.sum(collisions)
+
+        return np.concatenate((np.array([speed, dist_goal, collisions]), np.array(onehot)))
 
 
     def _generate_start_goal_pair(self):
@@ -169,17 +211,32 @@ class StraightDriveEnv(CarlaEnv):
         self.start_idx = self.start_goal_pairs[self.position_index][0]
         self.goal_idx = self.start_goal_pairs[self.position_index][1]
 
-        self.goal = [0, 0]
-        self.goal[0] = self.scene.player_start_spots[self.goal_idx].location.x / 100
-        self.goal[1] = self.scene.player_start_spots[self.goal_idx].location.y / 100 # cm -> m
+        start_point = self.scene.player_start_spots[self.start_idx]
+        end_point = self.scene.player_start_spots[self.goal_idx]
+        self.end_point = end_point
+
+        self.goal = [end_point.location.x / 100, end_point.location.y / 100] # cm -> m      
+
+        self.timeout_dist = self._planner.get_shortest_path_distance(
+            [start_point.location.x, start_point.location.y, 22], 
+            [start_point.orientation.x, start_point.orientation.y, 22],
+            [end_point.location.x, end_point.location.y, 22],
+            [end_point.orientation.x, end_point.orientation.y, 22]
+        )
+
+        self._calculate_timeout()
 
 
     def _is_goal(self, distance):
         return distance < 2.0
 
 
+    def _is_timed_out(self, current_time):
+        return (current_time - self.start_time) > (self.timeout_t * 1000)
+
+
     def _process_image(self, carla_raw_img):
-        return to_rgb_array(carla_raw_img)
+        return resize(to_rgb_array(carla_raw_img), (84,84,3))
 
 
     def _process_measurements(self, measurements):
@@ -196,24 +253,18 @@ class StraightDriveEnv(CarlaEnv):
         other_lane = player_measurements.intersection_otherlane
         offroad = player_measurements.intersection_offroad
 
-        return np.array([pos_x, pos_y, speed]), np.array([col_cars, col_ped, col_other]), np.array([other_lane, offroad])
+        onehot = self._calculate_planner_onehot(player_measurements.transform)
+    
+        return np.array([pos_x, pos_y, speed]), np.array([col_cars, col_ped, col_other]), np.array([other_lane, offroad]), onehot
 
 
 if __name__ == '__main__':
-    host = 'localhost'
-    port = 2000
+    s = StraightDriveEnv(2000)
+    s.reset()
 
     while True:
-        try:
-            with make_carla_client(host, port) as client:
-                s = StraightDriveEnv(client)
-                s.reset()
+        obs, r, done, _ = s.step([0., 0.2, 0.])
+        print(r, 'is the reward')
+        if done:
+            s.reset()
 
-                while True:
-                    obs, r, done, _ = s.step([0., 2.0, 0])
-                    print('Reward: {}'.format(r))
-                    if done:
-                        s.reset()
-        except TCPConnectionError as error:
-            print(error)
-            time.sleep(1) 

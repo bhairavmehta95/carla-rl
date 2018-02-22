@@ -4,10 +4,10 @@
 # This work is licensed under the terms of the MIT license.
 # For a copy, see <https://opensource.org/licenses/MIT>.
 
-from carla.planner.graph import sldist
+from environment.carla.planner.graph import sldist
 
-from carla.planner.astar import AStar
-from carla.planner.map import CarlaMap
+from environment.carla.planner.astar import AStar
+from environment.carla.planner.map import CarlaMap
 
 
 class CityTrack(object):
