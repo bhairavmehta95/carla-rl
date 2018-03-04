@@ -61,4 +61,5 @@ def mujoco_arg_parser():
     parser.add_argument('--env', help='environment ID', type=str, default="Reacher-v1")
     parser.add_argument('--seed', help='RNG seed', type=int, default=0)
     parser.add_argument('--num-timesteps', type=int, default=int(1e6))
+    parser.add_argument('--logdir', type=str, default='tb-dir')
     return parser

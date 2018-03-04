@@ -35,10 +35,11 @@ collisions    kg*cm/s
 
 
 class StraightDriveEnv(CarlaEnv):
-    def __init__(self, port, host='localhost', frame_skip=1, cam_width=800, cam_height=600, town_string='Town01', obs_size=84):
+    def __init__(self, port, gpu_num=0, host='localhost', frame_skip=1, cam_width=800, cam_height=600, town_string='Town01', obs_size=84):
         super(StraightDriveEnv, self).__init__()
 
-        self.c = CarlaServer(port)
+        self.c = CarlaServer(port, gpu_num=gpu_num)
+        self.port = port
         while True:
             try:
                 self.client = CarlaClient(host, port)
@@ -87,7 +88,7 @@ class StraightDriveEnv(CarlaEnv):
             spaces.Box(-np.inf, np.inf, (8,))
             )
         )
-        self.action_space = spaces.Box(-1, 1, shape=(4,))
+        self.action_space = spaces.Box(-1, 1, shape=(3,))
 
         self.prev_state = np.array([0., 0., 0.])
         self.prev_collisions = np.array([0., 0., 0.])
@@ -124,9 +125,9 @@ class StraightDriveEnv(CarlaEnv):
 
 
     def reset(self):
+        print('Starting new episode with CARLA: {}'.format(self.port))
         self._generate_start_goal_pair()
 
-        print('Starting new episode...')
         # Blocking function until episode is ready
         self.client.start_episode(self.start_idx)
 
@@ -232,7 +233,7 @@ class StraightDriveEnv(CarlaEnv):
 
 
     def _is_timed_out(self, current_time):
-        return (current_time - self.start_time) > (self.timeout_t * 1000)
+        return (current_time - self.start_time) > (self.timeout_t * 100)
 
 
     def _process_image(self, carla_raw_img):
